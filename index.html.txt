@@ -1,0 +1,1052 @@
+import { useState, useEffect, useCallback, useRef, useReducer } from "react";
+
+const APP_VER = "5.1";
+
+// ── STORAGE ──
+const ls = {
+  get: (k, fb = null) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del: (k) => { try { localStorage.removeItem(k); } catch {} },
+};
+const SK = { USERS:"ps_users", SESSION:"ps_session", HISTORY:"ps_history", API_KEY:"ps_gemini_key" };
+
+// ── AUTH ──
+const encode = s => btoa(unescape(encodeURIComponent(s)));
+function register({ name, email, password }) {
+  const users = ls.get(SK.USERS, []);
+  if (users.find(u => u.email.toLowerCase() === email.trim().toLowerCase()))
+    return { error: "E-mail já cadastrado. Faça login." };
+  const user = { id: Date.now().toString(), name: name.trim(), email: email.trim().toLowerCase(), hash: encode(password) };
+  ls.set(SK.USERS, [...users, user]);
+  return { user };
+}
+function login({ email, password }) {
+  const users = ls.get(SK.USERS, []);
+  const user = users.find(u => u.email.toLowerCase() === email.trim().toLowerCase());
+  if (!user) return { error: "E-mail não encontrado." };
+  if (user.hash !== encode(password)) return { error: "Senha incorreta." };
+  return { user };
+}
+
+// ── UTILS ──
+function ini(name = "") {
+  return name.split(" ").filter(Boolean).slice(0,2).map(w => w[0].toUpperCase()).join("") || "?";
+}
+function greeting() {
+  const h = new Date().getHours();
+  return h < 12 ? "Bom dia" : h < 18 ? "Boa tarde" : "Boa noite";
+}
+function useClock() {
+  const fmt = () => { const d = new Date(); return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`; };
+  const [t, setT] = useState(fmt);
+  useEffect(() => { const id = setInterval(() => setT(fmt()), 15000); return () => clearInterval(id); }, []);
+  return t;
+}
+
+// ── NAV ──
+const SCREEN_ORDER = ["home","capture","processing","result","company","settings"];
+const SCREEN_TO_NAV = { home:"home", capture:"capture", processing:"capture", result:"capture", company:"company", settings:"settings" };
+function navReducer(s, a) {
+  if (a.type !== "GO") return s;
+  const fi = SCREEN_ORDER.indexOf(s.current);
+  const ti = SCREEN_ORDER.indexOf(a.to);
+  return { prev: s.current, current: a.to, dir: ti >= fi ? "l" : "r" };
+}
+
+// ── IMAGE ──
+function compressImage(file, maxW = 1400, q = 0.82) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width: w, height: h } = img;
+      if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+      c.toBlob(b => b ? res(b) : rej(new Error("Compressão falhou")), "image/jpeg", q);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("Imagem inválida")); };
+    img.src = url;
+  });
+}
+function blobToBase64(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = () => rej(new Error("Erro de leitura"));
+    r.readAsDataURL(blob);
+  });
+}
+
+// ── GEMINI ──
+const PROMPT = `Você é especialista em folhas de ponto brasileiras (CLT/PJU).
+Analise a imagem e extraia TODOS os registros de horário visíveis.
+Retorne SOMENTE JSON válido sem markdown nem texto extra:
+{"employee":{"name":"Nome completo ou null","id":null,"department":null,"period":null},"records":[{"day":"Seg, 14/04","entry":"08:02","lunch_out":"12:05","lunch_back":"13:05","exit":"17:32","total":"8h 30m","note":null}],"summary":{"total_hours":"41h 58m","extra_hours":"+1h 58m","missing_hours":"0h 00m","delays":"0h 25m","absences":0},"confidence":0.95,"warnings":[]}
+Regras: Se campo não identificado use null. Se não for folha de ponto retorne {"error":"Imagem não é uma folha de ponto"}. confidence entre 0 e 1.`;
+
+async function analyzeWithGemini(base64, apiKey, onStep) {
+  if (!apiKey?.trim()) throw new Error("Chave API não configurada. Vá em Configurações → Chave Gemini API.");
+  onStep(1);
+  let res;
+  try {
+    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey.trim()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: "image/jpeg", data: base64 } }, { text: PROMPT }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 2048 } })
+    });
+  } catch { throw new Error("Sem conexão. Verifique sua internet."); }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const msg = err?.error?.message || "";
+    if (res.status === 400) throw new Error("Chave API inválida. Verifique em Configurações.");
+    if (res.status === 403) throw new Error("Chave sem permissão. Ative a Gemini API no Google AI Studio.");
+    if (res.status === 429) throw new Error("Limite atingido. Aguarde 1 minuto.");
+    throw new Error(msg || `Erro ${res.status}.`);
+  }
+  onStep(2);
+  const data = await res.json();
+  if (data.candidates?.[0]?.finishReason === "SAFETY") throw new Error("Imagem bloqueada por filtros. Tente outra.");
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  if (!text) throw new Error("Resposta vazia. Tente novamente.");
+  onStep(3);
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Formato inesperado. Tente novamente.");
+  let parsed;
+  try { parsed = JSON.parse(match[0]); } catch { throw new Error("Erro ao interpretar. Tente novamente."); }
+  if (parsed.error) throw new Error(parsed.error);
+  return parsed;
+}
+
+// ── STYLES ──
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  :root{
+    --cy:#06B6D4;--cy2:#0891B2;--cyd:rgba(6,182,212,0.12);--cyb:rgba(6,182,212,0.26);
+    --gr:#22C55E;--am:#EAB308;--re:#EF4444;--vi:#818CF8;
+    --b0:#060B18;--b1:#09101F;--b2:rgba(255,255,255,0.05);
+    --bd:rgba(255,255,255,0.08);--bd2:rgba(255,255,255,0.13);
+    --t1:#E2E8F7;--t2:#94A3C4;--t3:#4A5980;
+    --ff:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+    --tr:all 0.22s cubic-bezier(0.4,0,0.2,1);
+  }
+  .aw{display:flex;align-items:center;justify-content:center;min-height:520px;padding:12px;background:radial-gradient(ellipse 80% 50% at 50% 0%,#0D2040 0%,#060B18 65%);}
+  .shell{width:390px;height:820px;position:relative;background:var(--b1);border-radius:44px;box-shadow:0 0 0 1px #1E2D4A,0 30px 80px rgba(0,0,0,0.75);overflow:hidden;flex-shrink:0;}
+  .notch{position:absolute;top:0;left:50%;transform:translateX(-50%);width:110px;height:30px;background:var(--b1);border-radius:0 0 20px 20px;z-index:200;}
+  .scr{position:absolute;inset:0;border-radius:44px;overflow:hidden;pointer-events:none;transition:transform 0.38s cubic-bezier(0.4,0,0.2,1),opacity 0.36s ease;}
+  .scr[data-s="on"]{transform:translateX(0);opacity:1;pointer-events:auto;z-index:10;}
+  .scr[data-s="l"]{transform:translateX(-100%);opacity:0;z-index:1;}
+  .scr[data-s="r"]{transform:translateX(100%);opacity:0;z-index:1;}
+  .scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:none;}
+  .scroll::-webkit-scrollbar{display:none;}
+  .sbar{position:sticky;top:0;display:flex;align-items:flex-start;justify-content:space-between;padding:13px 26px 0;height:50px;z-index:50;pointer-events:none;}
+  .sbar-t{font-family:var(--fb);font-size:15px;font-weight:600;color:var(--t1);}
+  .sbar-i{display:flex;gap:5px;align-items:center;}
+  .card{background:var(--b2);border:1px solid var(--bd);border-radius:20px;}
+  .card-c{background:var(--cyd);border:1px solid var(--cyb);border-radius:20px;}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:none;border-radius:14px;font-family:var(--fb);font-size:14px;font-weight:600;cursor:pointer;transition:var(--tr);-webkit-tap-highlight-color:transparent;}
+  .btn-p{background:linear-gradient(135deg,var(--cy),var(--cy2));color:#fff;box-shadow:0 6px 20px rgba(6,182,212,0.32);}
+  .btn-p:hover{filter:brightness(1.08);}
+  .btn-p:active{transform:scale(0.97);}
+  .btn-p:disabled{opacity:0.45;cursor:not-allowed;transform:none;}
+  .btn-s{background:rgba(255,255,255,0.06);color:var(--t2);border:1px solid var(--bd);}
+  .btn-s:hover{background:rgba(255,255,255,0.10);}
+  .btn-g{width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,0.06);border:1px solid var(--bd);color:var(--t2);padding:0;}
+  .btn-g:hover{background:rgba(255,255,255,0.10);}
+  .btn-danger{background:rgba(239,68,68,0.12);color:#FCA5A5;border:1px solid rgba(239,68,68,0.3);}
+  .btn-danger:hover{background:rgba(239,68,68,0.2);}
+  .bnav{position:absolute;bottom:0;left:0;right:0;height:80px;display:flex;align-items:center;justify-content:space-around;padding:0 6px 16px;background:linear-gradient(to top,rgba(9,16,31,0.97) 55%,transparent);backdrop-filter:blur(20px);border-top:1px solid rgba(255,255,255,0.04);z-index:100;}
+  .ni{display:flex;flex-direction:column;align-items:center;gap:4px;padding:7px 14px;border-radius:12px;border:none;background:transparent;cursor:pointer;transition:var(--tr);}
+  .ni-l{font-size:10px;font-weight:600;}
+  .ni[aria-current="page"] .ni-l{color:var(--cy);}
+  .ni:not([aria-current="page"]) .ni-l{color:var(--t3);}
+  .badge{display:inline-flex;align-items:center;gap:3px;border-radius:8px;font-size:11px;font-weight:700;padding:3px 8px;}
+  .b-ok{background:rgba(34,197,94,0.14);color:var(--gr);}
+  .b-warn{background:rgba(234,179,8,0.14);color:var(--am);}
+  .b-err{background:rgba(239,68,68,0.14);color:var(--re);}
+  .b-inf{background:rgba(6,182,212,0.14);color:var(--cy);}
+  .av{border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--ff);font-weight:700;flex-shrink:0;}
+  .tt{width:100%;border-collapse:collapse;}
+  .tt th{font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.08em;padding:0 0 10px;text-align:left;}
+  .tt td{font-size:12px;color:var(--t2);padding:9px 0;border-top:1px solid rgba(255,255,255,0.05);}
+  .sf{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+  .sr{width:260px;height:185px;position:relative;}
+  .co{position:absolute;width:22px;height:22px;border-color:var(--cy);border-style:solid;}
+  .tl{top:0;left:0;border-width:3px 0 0 3px;border-radius:4px 0 0 0;}
+  .tr{top:0;right:0;border-width:3px 3px 0 0;border-radius:0 4px 0 0;}
+  .bl{bottom:0;left:0;border-width:0 0 3px 3px;border-radius:0 0 0 4px;}
+  .br{bottom:0;right:0;border-width:0 3px 3px 0;border-radius:0 0 4px 0;}
+  .pd{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;font-weight:700;}
+  .pd-done{background:rgba(34,197,94,0.14);color:var(--gr);}
+  .pd-active{background:rgba(6,182,212,0.18);color:var(--cy);}
+  .pd-wait{background:rgba(255,255,255,0.05);color:var(--t3);}
+  .auth-wrap{position:absolute;inset:0;border-radius:44px;overflow:hidden;background:var(--b1);display:flex;flex-direction:column;}
+  .auth-scroll{flex:1;overflow-y:auto;scrollbar-width:none;}
+  .auth-scroll::-webkit-scrollbar{display:none;}
+  .inp{width:100%;height:50px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.10);border-radius:14px;color:var(--t1);font-family:var(--fb);font-size:14px;padding:0 16px;outline:none;transition:var(--tr);}
+  .inp::placeholder{color:var(--t3);}
+  .inp:focus{border-color:rgba(6,182,212,0.5);background:rgba(6,182,212,0.05);}
+  .inp.err{border-color:rgba(239,68,68,0.5);background:rgba(239,68,68,0.05);}
+  .inp-key{width:100%;background:rgba(255,255,255,0.04);border:1px solid var(--bd);border-radius:12px;color:var(--t1);font-family:var(--fm);font-size:12px;padding:12px 44px 12px 14px;outline:none;transition:var(--tr);}
+  .inp-key:focus{border-color:var(--cyb);background:var(--cyd);}
+  .inp-key::placeholder{color:var(--t3);}
+  .auth-err{font-size:12px;color:#FCA5A5;padding:8px 12px;background:rgba(239,68,68,0.1);border-radius:8px;border:1px solid rgba(239,68,68,0.2);}
+  .srow{display:flex;align-items:center;padding:13px 0;border-bottom:1px solid rgba(255,255,255,0.05);cursor:pointer;}
+  .srow:last-child{border-bottom:none;}
+  .toast{position:absolute;bottom:90px;left:16px;right:16px;padding:13px 15px;background:rgba(15,20,40,0.95);border:1px solid rgba(239,68,68,0.4);border-radius:14px;color:#FCA5A5;font-size:13px;line-height:1.5;z-index:500;backdrop-filter:blur(20px);}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.95)}}
+  @keyframes scanAn{0%,100%{top:6px}50%{top:165px}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(6,182,212,0.3)}50%{box-shadow:0 0 20px 5px rgba(6,182,212,0.12)}}
+  .spin{animation:spin 1.1s linear infinite;}
+  .pulse{animation:pulse 1.6s ease-in-out infinite;}
+  .scan-b{position:absolute;left:8px;right:8px;height:2px;background:linear-gradient(90deg,transparent,#06B6D4,transparent);animation:scanAn 2s ease-in-out infinite;}
+  .glow{animation:glow 2s ease-in-out infinite;}
+  .toast{animation:fadeIn .3s ease;}
+  .f0{animation:fadeIn .38s both}.f1{animation:fadeIn .38s .07s both}.f2{animation:fadeIn .38s .14s both}.f3{animation:fadeIn .38s .21s both}.f4{animation:fadeIn .38s .28s both}
+`;
+
+// ── ICONS ──
+const I = {
+  Home:  ({a}) => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={a?"#06B6D4":"#4A5980"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>,
+  Scan:  ({a}) => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={a?"#06B6D4":"#4A5980"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="3" y1="12" x2="21" y2="12"/></svg>,
+  Users: ({a}) => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={a?"#06B6D4":"#4A5980"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>,
+  Cog:   ({a}) => <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={a?"#06B6D4":"#4A5980"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+  Back:  () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="15 18 9 12 15 6"/></svg>,
+  Arrow: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4A5980" strokeWidth="2.5" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>,
+  Img:   () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>,
+  Cam:   () => <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>,
+  Brain: () => <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#06B6D4" strokeWidth="1.8" strokeLinecap="round"><path d="M9.5 2a5 5 0 0 1 5 5c0 .47-.06.93-.18 1.37A5 5 0 0 1 18 13a4.98 4.98 0 0 1-3.37 4.73A5 5 0 0 1 9.5 22a5 5 0 0 1-5-5 5 5 0 0 1 .73-2.62A5 5 0 0 1 2 10a5 5 0 0 1 3.55-4.77A5 5 0 0 1 9.5 2z"/></svg>,
+  Chk:   ({c="#22C55E"}) => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="3.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>,
+  Dl:    () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+  Share: () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>,
+  Eye:   ({s}) => s
+    ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+    : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>,
+  Key:   () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
+  Lock:  () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>,
+  Mail:  () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>,
+  User:  () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
+  Warn:  () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>,
+  Out:   () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>,
+  Trash: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg>,
+  Bolt:  () => <svg width="16" height="16" viewBox="0 0 24 24" fill="white"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>,
+};
+
+// ── STATUS BAR ──
+function SBar() {
+  const t = useClock();
+  return (
+    <div className="sbar" aria-hidden="true">
+      <span className="sbar-t">{t}</span>
+      <div className="sbar-i">
+        <svg width="17" height="12" viewBox="0 0 17 12"><rect x="0" y="3" width="3" height="9" rx="1" fill="#E2E8F7"/><rect x="4.5" y="2" width="3" height="10" rx="1" fill="#E2E8F7"/><rect x="9" y="0.5" width="3" height="11.5" rx="1" fill="#E2E8F7"/><rect x="13.5" y="0" width="3" height="12" rx="1" fill="#E2E8F7"/></svg>
+        <svg width="26" height="13" viewBox="0 0 26 13"><rect x="0" y="1" width="23" height="11" rx="3.5" stroke="#E2E8F7" strokeWidth="1"/><rect x="1.5" y="2.5" width="18" height="8" rx="2" fill="#E2E8F7"/><path d="M24.5 4.5v4a2 2 0 0 0 0-4z" fill="#E2E8F7" opacity=".5"/></svg>
+      </div>
+    </div>
+  );
+}
+
+// ── BOTTOM NAV ──
+const NAV_ITEMS = [
+  { id:"home", label:"Início", Ic:I.Home },
+  { id:"capture", label:"Escanear", Ic:I.Scan },
+  { id:"company", label:"Empresa", Ic:I.Users },
+  { id:"settings", label:"Config.", Ic:I.Cog },
+];
+function BNav({ cur, onNav }) {
+  const active = SCREEN_TO_NAV[cur];
+  return (
+    <nav className="bnav">
+      {NAV_ITEMS.map(({ id, label, Ic }) => (
+        <button key={id} className="ni" onClick={() => onNav(id)}
+          aria-current={active === id ? "page" : undefined}>
+          <Ic a={active === id} />
+          <span className="ni-l">{label}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+// ── LOGIN ──
+function LoginScreen({ onLogin, onReg }) {
+  const [email, setEmail] = useState("");
+  const [pwd, setPwd] = useState("");
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState("");
+  const [load, setLoad] = useState(false);
+
+  const go = useCallback(async () => {
+    if (!email.trim() || !pwd) return setErr("Preencha todos os campos.");
+    setLoad(true); setErr("");
+    await new Promise(r => setTimeout(r, 350));
+    const { user, error } = login({ email, password: pwd });
+    setLoad(false);
+    if (error) return setErr(error);
+    const sess = { id: user.id, name: user.name, email: user.email };
+    ls.set(SK.SESSION, sess);
+    onLogin(sess);
+  }, [email, pwd, onLogin]);
+
+  return (
+    <div className="auth-wrap">
+      <SBar />
+      <div className="auth-scroll">
+        <div style={{ padding:"10px 26px 60px" }}>
+          <div style={{ textAlign:"center", margin:"24px 0 32px" }}>
+            <div style={{ width:58, height:58, borderRadius:17, background:"linear-gradient(135deg,#06B6D4,#0891B2)", display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 13px", boxShadow:"0 8px 28px rgba(6,182,212,0.35)" }}>
+              <I.Bolt />
+            </div>
+            <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:23, fontWeight:800, color:"#E2E8F7", letterSpacing:"-0.03em", marginBottom:5 }}>PontoScan AI</h1>
+            <p style={{ fontSize:13, color:"#4A5980" }}>Acesse sua conta</p>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:15 }}>
+            <div>
+              <label style={{ fontSize:11, fontWeight:700, color:"#4A5980", textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5, marginBottom:8 }}><I.Mail /> E-mail</label>
+              <input className={`inp${err&&!email.trim()?" err":""}`} type="email" placeholder="seu@email.com"
+                value={email} onChange={e => { setEmail(e.target.value); setErr(""); }}
+                onKeyDown={e => e.key==="Enter" && go()} autoComplete="email" />
+            </div>
+            <div>
+              <label style={{ fontSize:11, fontWeight:700, color:"#4A5980", textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5, marginBottom:8 }}><I.Lock /> Senha</label>
+              <div style={{ position:"relative" }}>
+                <input className={`inp${err&&!pwd?" err":""}`} type={show?"text":"password"} placeholder="••••••••"
+                  value={pwd} onChange={e => { setPwd(e.target.value); setErr(""); }}
+                  onKeyDown={e => e.key==="Enter" && go()} style={{ paddingRight:46 }} autoComplete="current-password" />
+                <button onClick={() => setShow(v=>!v)} style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", color:"#4A5980", padding:0 }}>
+                  <I.Eye s={show} />
+                </button>
+              </div>
+            </div>
+            {err && <div className="auth-err">{err}</div>}
+            <button className="btn btn-p" style={{ height:50, fontSize:15 }} onClick={go} disabled={load}>
+              {load ? <><svg className="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="20"/></svg> Entrando…</> : "Entrar"}
+            </button>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:10, margin:"24px 0" }}>
+            <div style={{ flex:1, height:1, background:"rgba(255,255,255,0.07)" }} />
+            <span style={{ fontSize:12, color:"#4A5980" }}>não tem conta?</span>
+            <div style={{ flex:1, height:1, background:"rgba(255,255,255,0.07)" }} />
+          </div>
+          <button className="btn btn-s" style={{ width:"100%", height:46 }} onClick={onReg}>Criar conta grátis</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── REGISTER ──
+function RegScreen({ onLogin, onBack }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [pwd, setPwd] = useState("");
+  const [pwd2, setPwd2] = useState("");
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState("");
+  const [load, setLoad] = useState(false);
+
+  const go = useCallback(async () => {
+    if (!name.trim()) return setErr("Informe seu nome.");
+    if (!email.trim()) return setErr("Informe seu e-mail.");
+    if (!/\S+@\S+\.\S+/.test(email)) return setErr("E-mail inválido.");
+    if (pwd.length < 6) return setErr("Senha: mínimo 6 caracteres.");
+    if (pwd !== pwd2) return setErr("As senhas não coincidem.");
+    setLoad(true); setErr("");
+    await new Promise(r => setTimeout(r, 400));
+    const { user, error } = register({ name, email, password: pwd });
+    setLoad(false);
+    if (error) return setErr(error);
+    const sess = { id: user.id, name: user.name, email: user.email };
+    ls.set(SK.SESSION, sess);
+    onLogin(sess);
+  }, [name, email, pwd, pwd2, onLogin]);
+
+  return (
+    <div className="auth-wrap">
+      <SBar />
+      <div className="auth-scroll">
+        <div style={{ padding:"10px 26px 60px" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:26 }}>
+            <button className="btn btn-g" onClick={onBack}><I.Back /></button>
+            <div>
+              <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:20, fontWeight:800, color:"#E2E8F7" }}>Criar conta</h1>
+              <p style={{ fontSize:12, color:"#4A5980" }}>Preencha os dados abaixo</p>
+            </div>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:13 }}>
+            {[
+              { label:"Nome completo", Icon:I.User, val:name, set:setName, type:"text", ph:"João Silva", ac:"name" },
+              { label:"E-mail", Icon:I.Mail, val:email, set:setEmail, type:"email", ph:"joao@empresa.com", ac:"email" },
+            ].map(({ label, Icon, val, set, type, ph, ac }) => (
+              <div key={label}>
+                <label style={{ fontSize:11, fontWeight:700, color:"#4A5980", textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5, marginBottom:8 }}><Icon /> {label}</label>
+                <input className="inp" type={type} placeholder={ph} value={val}
+                  onChange={e => { set(e.target.value); setErr(""); }} autoComplete={ac} />
+              </div>
+            ))}
+            <div>
+              <label style={{ fontSize:11, fontWeight:700, color:"#4A5980", textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5, marginBottom:8 }}><I.Lock /> Senha (mín. 6)</label>
+              <div style={{ position:"relative" }}>
+                <input className="inp" type={show?"text":"password"} placeholder="••••••••" value={pwd}
+                  onChange={e => { setPwd(e.target.value); setErr(""); }} style={{ paddingRight:46 }} autoComplete="new-password" />
+                <button onClick={() => setShow(v=>!v)} style={{ position:"absolute", right:14, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", color:"#4A5980", padding:0 }}>
+                  <I.Eye s={show} />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize:11, fontWeight:700, color:"#4A5980", textTransform:"uppercase", letterSpacing:".06em", display:"flex", alignItems:"center", gap:5, marginBottom:8 }}><I.Lock /> Confirmar senha</label>
+              <input className="inp" type={show?"text":"password"} placeholder="••••••••" value={pwd2}
+                onChange={e => { setPwd2(e.target.value); setErr(""); }} autoComplete="new-password" />
+            </div>
+            {err && <div className="auth-err">{err}</div>}
+            <button className="btn btn-p" style={{ height:50, fontSize:15 }} onClick={go} disabled={load}>
+              {load ? <><svg className="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="20"/></svg> Criando…</> : "Criar conta"}
+            </button>
+            <p style={{ textAlign:"center", fontSize:12, color:"#4A5980" }}>
+              Já tem conta?{" "}
+              <span style={{ color:"#06B6D4", cursor:"pointer", fontWeight:600 }} onClick={onBack}>Entrar</span>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── HOME ──
+function HomeScreen({ onCapture, history, session }) {
+  const cols = ["#06B6D4","#22C55E","#818CF8","#EAB308","#EF4444"];
+  return (
+    <div className="scroll">
+      <SBar />
+      <main style={{ padding:"4px 20px 96px" }}>
+        <header className="f0" style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:22 }}>
+          <div>
+            <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:4 }}>
+              <div style={{ width:28, height:28, borderRadius:8, background:"linear-gradient(135deg,#06B6D4,#0891B2)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                <I.Bolt />
+              </div>
+              <span style={{ fontFamily:"'Syne',sans-serif", fontSize:17, fontWeight:800, color:"#E2E8F7", letterSpacing:"-0.03em" }}>PontoScan AI</span>
+            </div>
+            <p style={{ fontSize:12, color:"#4A5980" }}>{greeting()}, <strong style={{ color:"#06B6D4" }}>{session.name.split(" ")[0]}</strong> 👋</p>
+          </div>
+          <div className="av" style={{ width:36, height:36, background:"linear-gradient(135deg,#06B6D4,#0891B2)", fontSize:12, color:"#fff" }}>
+            {ini(session.name)}
+          </div>
+        </header>
+
+        <div className="f1" style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:18 }}>
+          {[
+            { label:"Processados", val:history.length.toString(), color:"#22C55E" },
+            { label:"Essa semana", val:history.filter(h => Date.now()-new Date(h.ts||0)<6.048e8).length.toString(), color:"#06B6D4" },
+            { label:"Com IA", val:history.length.toString(), color:"#818CF8" },
+          ].map(({ label, val, color }) => (
+            <div key={label} className="card" style={{ padding:"11px 6px", textAlign:"center" }}>
+              <p style={{ fontFamily:"'DM Mono',monospace", fontSize:22, fontWeight:500, color, lineHeight:1 }}>{val}</p>
+              <p style={{ fontSize:9.5, color:"#4A5980", marginTop:4, fontWeight:600 }}>{label}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="f2 card-c" style={{ padding:18, marginBottom:22 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:14 }}>
+            <div style={{ width:48, height:48, borderRadius:14, background:"rgba(6,182,212,0.1)", border:"1px solid rgba(6,182,212,0.26)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#06B6D4" strokeWidth="1.8" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </div>
+            <div>
+              <p style={{ fontFamily:"'Syne',sans-serif", fontSize:14, fontWeight:700, color:"#E2E8F7" }}>Escanear folha de ponto</p>
+              <p style={{ fontSize:11, color:"#4A5980", marginTop:2 }}>Foto ou galeria · OCR com Gemini Vision</p>
+            </div>
+          </div>
+          <button className="btn btn-p" style={{ width:"100%", height:48 }} onClick={onCapture}>
+            <I.Scan a={true} /> Analisar folha de ponto
+          </button>
+        </div>
+
+        <section className="f3">
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+            <p style={{ fontFamily:"'Syne',sans-serif", fontSize:13, fontWeight:700, color:"#94A3C4" }}>Processamentos recentes</p>
+            <span className="badge b-inf">{history.length} total</span>
+          </div>
+          {history.length === 0 ? (
+            <div className="card" style={{ padding:26, textAlign:"center" }}>
+              <p style={{ fontSize:24, marginBottom:8 }}>📋</p>
+              <p style={{ fontSize:13, color:"#94A3C4", fontWeight:600 }}>Nenhuma folha ainda</p>
+              <p style={{ fontSize:12, color:"#4A5980", marginTop:4 }}>Escaneie sua primeira folha acima</p>
+            </div>
+          ) : (
+            <div className="card" style={{ padding:"2px 14px" }}>
+              {history.slice(0,6).map((item, i) => (
+                <div key={i} style={{ display:"flex", alignItems:"center", padding:"11px 0", borderBottom:i<Math.min(history.length,6)-1?"1px solid rgba(255,255,255,0.05)":"none" }}>
+                  <div className="av" style={{ width:34, height:34, fontSize:11, fontWeight:700, background:`${cols[i%5]}18`, color:cols[i%5], border:`1px solid ${cols[i%5]}35`, marginRight:10 }}>
+                    {ini(item.name)}
+                  </div>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <p style={{ fontSize:13, fontWeight:600, color:"#94A3C4", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{item.name}</p>
+                    <p style={{ fontSize:11, color:"#4A5980" }}>{item.date}</p>
+                  </div>
+                  <div style={{ textAlign:"right", flexShrink:0 }}>
+                    <p style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color:"#94A3C4", marginBottom:4 }}>{item.hours||"—"}</p>
+                    <span className="badge b-ok">✓ OK</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+// ── CAPTURE ──
+function CaptureScreen({ onBack, onProcess, apiKey }) {
+  const fileRef = useRef(null);
+  const noKey = !apiKey?.trim();
+  const handleFile = useCallback(file => {
+    if (!file || !file.type.startsWith("image/")) return;
+    if (file.size > 25 * 1024 * 1024) return alert("Imagem muito grande. Máximo 25 MB.");
+    onProcess(file);
+  }, [onProcess]);
+
+  return (
+    <div style={{ height:"100%", background:"#060A14", display:"flex", flexDirection:"column" }}>
+      <SBar />
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"4px 18px 12px" }}>
+        <button className="btn btn-g" onClick={onBack}><I.Back /></button>
+        <p style={{ fontFamily:"'Syne',sans-serif", fontSize:15, fontWeight:700, color:"#E2E8F7" }}>Capturar folha</p>
+        <div style={{ width:38 }} />
+      </div>
+      <div style={{ flex:1, position:"relative", background:"radial-gradient(ellipse at center,#0D1F35 0%,#060A14 100%)" }}>
+        {[33,66].map(p => <div key={`v${p}`} style={{ position:"absolute", left:`${p}%`, top:0, bottom:0, width:1, background:"rgba(255,255,255,0.03)" }} />)}
+        {[33,66].map(p => <div key={`h${p}`} style={{ position:"absolute", top:`${p}%`, left:0, right:0, height:1, background:"rgba(255,255,255,0.03)" }} />)}
+        <div className="sf">
+          <div className="sr">
+            <div className="co tl" /><div className="co tr" />
+            <div className="co bl" /><div className="co br" />
+            <div className="scan-b" />
+          </div>
+        </div>
+        <p style={{ position:"absolute", bottom:16, left:0, right:0, textAlign:"center", fontSize:12, color:"#4A5980" }}>
+          Centralize a folha de ponto no quadro
+        </p>
+      </div>
+      {noKey && (
+        <div style={{ margin:"0 14px 8px", padding:"10px 13px", background:"rgba(234,179,8,0.09)", border:"1px solid rgba(234,179,8,0.25)", borderRadius:12, display:"flex", alignItems:"center", gap:9 }}>
+          <I.Warn />
+          <p style={{ fontSize:12, color:"#EAB308" }}>Configure a <strong>Chave Gemini API</strong> em Configurações primeiro.</p>
+        </div>
+      )}
+      <div style={{ padding:"12px 24px 36px", display:"flex", gap:11, background:"#060A14" }}>
+        <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }}
+          onChange={e => { handleFile(e.target.files?.[0]); e.target.value=""; }} />
+        <button className="btn btn-s" style={{ flex:1, height:50 }}
+          onClick={() => { fileRef.current.removeAttribute("capture"); fileRef.current.click(); }}>
+          <I.Img /> Galeria
+        </button>
+        <button className="btn btn-s" style={{ flex:1, height:50 }}
+          onClick={() => { fileRef.current.setAttribute("capture","environment"); fileRef.current.click(); }}>
+          <I.Cam /> Câmera
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── PROCESSING ──
+const STEPS = [
+  { l:"Comprimindo imagem", s:"Otimizando para análise..." },
+  { l:"OCR com Gemini Vision", s:"Lendo texto e tabelas..." },
+  { l:"Organizando registros", s:"Estruturando horários..." },
+  { l:"Calculando totais", s:"Verificando inconsistências..." },
+];
+function ProcessingScreen({ file, apiKey, onDone, onError }) {
+  const [step, setStep] = useState(-1);
+  const [pct, setPct] = useState(0);
+  const abort = useRef(false);
+  const ran = useRef(false);
+
+  const run = useCallback(async () => {
+    if (!file || ran.current) return;
+    ran.current = true; abort.current = false;
+    try {
+      setStep(0); setPct(10);
+      const blob = await compressImage(file);
+      if (abort.current) return;
+      const b64 = await blobToBase64(blob);
+      if (abort.current) return;
+      const result = await analyzeWithGemini(b64, apiKey, s => {
+        if (abort.current) return;
+        setStep(s);
+        setPct(Math.round((s + 1) / STEPS.length * 85) + 10);
+      });
+      if (abort.current) return;
+      setStep(STEPS.length); setPct(100);
+      setTimeout(() => { if (!abort.current) onDone(result, file); }, 500);
+    } catch(e) {
+      if (!abort.current) onError(e.message || "Erro inesperado.");
+    }
+  }, [file, apiKey, onDone, onError]);
+
+  useEffect(() => { run(); return () => { abort.current = true; }; }, [run]);
+
+  return (
+    <div className="scroll">
+      <SBar />
+      <div style={{ padding:"8px 20px 100px", display:"flex", flexDirection:"column", alignItems:"center" }}>
+        <div style={{ width:90, height:90, position:"relative", margin:"24px auto 24px", display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <svg className="spin" width="90" height="90" viewBox="0 0 100 100" style={{ position:"absolute" }}>
+            <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(6,182,212,0.12)" strokeWidth="4"/>
+            <circle cx="50" cy="50" r="44" fill="none" stroke="#06B6D4" strokeWidth="4" strokeLinecap="round" strokeDasharray="58 218"/>
+          </svg>
+          <div className="glow" style={{ width:64, height:64, borderRadius:"50%", background:"rgba(6,182,212,0.09)", border:"1px solid rgba(6,182,212,0.28)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <I.Brain />
+          </div>
+        </div>
+        <h1 className="f1" style={{ fontFamily:"'Syne',sans-serif", fontSize:18, fontWeight:800, color:"#E2E8F7", letterSpacing:"-0.03em", textAlign:"center", marginBottom:5 }}>
+          Analisando com Gemini Vision…
+        </h1>
+        <p className="f2" style={{ fontSize:13, color:"#4A5980", textAlign:"center", marginBottom:24 }}>Aguarde, processando sua folha de ponto</p>
+        <div className="f2" style={{ width:"100%", height:5, borderRadius:5, background:"rgba(255,255,255,0.06)", marginBottom:24, overflow:"hidden" }}>
+          <div style={{ height:"100%", borderRadius:5, background:"linear-gradient(90deg,#06B6D4,#0891B2)", width:`${pct}%`, transition:"width 0.65s ease" }} />
+        </div>
+        <div className="card f3" style={{ width:"100%", padding:"4px 16px" }}>
+          {STEPS.map((s, i) => {
+            const done = i < step, active = i === step;
+            return (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:13, padding:"12px 0", borderBottom:i<STEPS.length-1?"1px solid rgba(255,255,255,0.05)":"none" }}>
+                <div className={`pd ${done?"pd-done":active?"pd-active":"pd-wait"}`}>
+                  {done ? <I.Chk />
+                  : active ? <div className="pulse" style={{ width:10, height:10, borderRadius:"50%", background:"#06B6D4" }} />
+                  : <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12 }}>{i+1}</span>}
+                </div>
+                <div>
+                  <p style={{ fontSize:13, fontWeight:600, color:done?"#22C55E":active?"#E2E8F7":"#4A5980" }}>{s.l}</p>
+                  {active && <p style={{ fontSize:12, color:"#4A5980", marginTop:2 }}>{s.s}</p>}
+                </div>
+                {done && <div style={{ marginLeft:"auto" }}><I.Chk /></div>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── RESULT ──
+function ResultScreen({ data, imageFile, onBack, onHome }) {
+  const [imgUrl, setImgUrl] = useState(null);
+  useEffect(() => {
+    if (!imageFile) return;
+    const url = URL.createObjectURL(imageFile);
+    setImgUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [imageFile]);
+
+  const emp = data?.employee || {};
+  const recs = data?.records || [];
+  const sum = data?.summary || {};
+  const conf = data?.confidence || 0;
+  const warns = data?.warnings || [];
+
+  return (
+    <div className="scroll">
+      <SBar />
+      <div style={{ padding:"6px 20px 96px" }}>
+        <div className="f0" style={{ display:"flex", alignItems:"center", gap:10, marginBottom:18 }}>
+          <button className="btn btn-g" onClick={onBack}><I.Back /></button>
+          <div style={{ flex:1 }}>
+            <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:16, fontWeight:700, color:"#E2E8F7" }}>Resultado</h1>
+            <p style={{ fontSize:12, color:"#4A5980" }}>Processado pelo Gemini Vision</p>
+          </div>
+          <span className="badge b-ok">✓ Concluído</span>
+        </div>
+
+        {conf > 0 && (
+          <div className="f0 card" style={{ padding:"10px 14px", marginBottom:11, display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ flex:1 }}>
+              <p style={{ fontSize:11, color:"#4A5980", marginBottom:5 }}>Confiança da extração</p>
+              <div style={{ height:4, borderRadius:4, background:"rgba(255,255,255,0.07)", overflow:"hidden" }}>
+                <div style={{ height:"100%", width:`${conf*100}%`, borderRadius:4, transition:"width .6s ease", background:conf>.8?"#22C55E":conf>.5?"#EAB308":"#EF4444" }} />
+              </div>
+            </div>
+            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:14, color:conf>.8?"#22C55E":"#EAB308" }}>
+              {Math.round(conf*100)}%
+            </span>
+          </div>
+        )}
+
+        {warns.map((w,i) => (
+          <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start", padding:"10px 13px", borderRadius:11, background:"rgba(234,179,8,0.08)", border:"1px solid rgba(234,179,8,0.22)", marginBottom:8 }}>
+            <div style={{ color:"#EAB308", flexShrink:0 }}><I.Warn /></div>
+            <p style={{ fontSize:12, color:"#EAB308", lineHeight:1.55 }}>{w}</p>
+          </div>
+        ))}
+
+        <div className="f1 card" style={{ padding:14, marginBottom:12, display:"flex", alignItems:"center", gap:12 }}>
+          {imgUrl
+            ? <img src={imgUrl} alt="Folha" style={{ width:46, height:46, borderRadius:11, objectFit:"cover", border:"1px solid rgba(255,255,255,0.08)" }} />
+            : <div className="av" style={{ width:46, height:46, background:"rgba(6,182,212,0.12)", fontSize:14, fontWeight:700, color:"#06B6D4", border:"1.5px solid rgba(6,182,212,0.28)" }}>{ini(emp.name||"?")}</div>
+          }
+          <div style={{ flex:1 }}>
+            <p style={{ fontFamily:"'Syne',sans-serif", fontSize:15, fontWeight:700, color:"#E2E8F7" }}>{emp.name||"Não identificado"}</p>
+            <p style={{ fontSize:11, color:"#4A5980", marginTop:2 }}>
+              {[emp.id?`Mat. ${emp.id}`:null, emp.period, emp.department].filter(Boolean).join(" · ")||"—"}
+            </p>
+          </div>
+        </div>
+
+        <div className="f2" style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:14 }}>
+          {[
+            { l:"Total horas", v:sum.total_hours||"—", c:"#06B6D4", bg:"rgba(6,182,212,0.1)", bd:"rgba(6,182,212,0.22)" },
+            { l:"Horas extras", v:sum.extra_hours||"—", c:"#22C55E", bg:"rgba(34,197,94,0.1)", bd:"rgba(34,197,94,0.22)" },
+            { l:"Atrasos", v:sum.delays||"—", c:"#EAB308", bg:"rgba(234,179,8,0.1)", bd:"rgba(234,179,8,0.22)" },
+          ].map(({ l, v, c, bg, bd }) => (
+            <div key={l} style={{ background:bg, border:`1px solid ${bd}`, borderRadius:13, padding:"11px 7px", textAlign:"center" }}>
+              <p style={{ fontFamily:"'DM Mono',monospace", fontSize:13, fontWeight:500, color:c, lineHeight:1, wordBreak:"break-word" }}>{v}</p>
+              <p style={{ fontSize:9.5, color:"#4A5980", marginTop:4, fontWeight:600 }}>{l}</p>
+            </div>
+          ))}
+        </div>
+
+        {recs.length > 0 ? (
+          <div className="f3 card" style={{ padding:"14px 13px 8px", marginBottom:14 }}>
+            <h2 style={{ fontFamily:"'Syne',sans-serif", fontSize:13, fontWeight:700, color:"#94A3C4", marginBottom:11 }}>
+              Registros ({recs.length} dia{recs.length!==1?"s":""})
+            </h2>
+            <div style={{ overflowX:"auto" }}>
+              <table className="tt">
+                <thead><tr><th>Dia</th><th>Entrada</th><th>Saída</th><th>Pausa</th><th>Total</th></tr></thead>
+                <tbody>
+                  {recs.map((r,i) => (
+                    <tr key={i}>
+                      <td style={{ fontSize:11 }}>{r.day||"—"}</td>
+                      <td style={{ fontFamily:"'DM Mono',monospace", color:"#22C55E", fontSize:11 }}>{r.entry||"—"}</td>
+                      <td style={{ fontFamily:"'DM Mono',monospace", color:"#F87171", fontSize:11 }}>{r.exit||"—"}</td>
+                      <td style={{ fontFamily:"'DM Mono',monospace", color:"#EAB308", fontSize:11 }}>
+                        {r.lunch_out&&r.lunch_back?`${r.lunch_out}–${r.lunch_back}`:(r.pause||"—")}
+                      </td>
+                      <td style={{ fontFamily:"'DM Mono',monospace", fontSize:11 }}>
+                        {r.note?<span className="badge b-warn">{r.note}</span>:(r.total||"—")}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="f3 card" style={{ padding:20, textAlign:"center", marginBottom:14 }}>
+            <p style={{ fontSize:13, color:"#4A5980" }}>Nenhum registro identificado.</p>
+            <p style={{ fontSize:11, color:"#4A5980", marginTop:4 }}>Tente uma foto com melhor iluminação.</p>
+          </div>
+        )}
+
+        <div className="f4" style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:9 }}>
+          <button className="btn btn-p" style={{ height:44 }}><I.Dl /> Exportar</button>
+          <button className="btn btn-s" style={{ height:44 }}><I.Share /> Compartilhar</button>
+          <button className="btn btn-s" style={{ height:44, gridColumn:"1/-1" }} onClick={onHome}>Ir para o início</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── COMPANY ──
+const TEAM = [
+  { name:"João Silva", role:"Dev Sênior", h:"41h 58m", e:"+1h 58m", c:"#06B6D4" },
+  { name:"Maria Oliveira", role:"Analista RH", h:"40h 15m", e:"+0h 15m", c:"#22C55E" },
+  { name:"Carlos Mendes", role:"Designer UI", h:"38h 00m", e:"-2h 00m", c:"#EF4444" },
+  { name:"Ana Costa", role:"Product Mgr", h:"45h 05m", e:"+5h 05m", c:"#818CF8" },
+  { name:"Pedro Alves", role:"QA Engineer", h:"39h 30m", e:"-0h 30m", c:"#EAB308" },
+];
+function CompanyScreen() {
+  const [p, setP] = useState("semana");
+  return (
+    <div className="scroll">
+      <SBar />
+      <div style={{ padding:"6px 20px 96px" }}>
+        <header className="f0" style={{ marginBottom:16 }}>
+          <h1 style={{ fontFamily:"'Syne',sans-serif", fontSize:20, fontWeight:800, color:"#E2E8F7", letterSpacing:"-0.03em" }}>Empresa</h1>
+          <p style={{ fontSize:13, color:"#4A5980" }}>Relatório consolidado da equipe</p>
+        </header>
+        <div className="f1" style={{ display:"flex", gap:8, marginBottom:16 }}>
+          {["semana","mês","trimestre"].map(f => (
+            <button key={f} onClick={() => setP(f)} style={{
+              flex:1, height:33, borderRadius:10,
+              border:`1px solid ${p===f?"rgba(6,182,212,0.5)":"rgba(255,255,255,0.08)"}`,
+              background:p===f?"rgba(6,182,212,0.1)":"transparent",
+              color:p===f?"#06B6D4":"#4A5980",
+              fontSize:13, fontWeight:600, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", textTransform:"capitalize"
+            }}>{f}</button>
+          ))}
+        </div>
+        <div className="f2 card" style={{ padding:14, marginBottom:15 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+            {[
+              { l:"Colaboradores", v:"5", i:"👥" },
+              { l:"Média horas", v:"41h 06m", i:"⏱" },
+              { l:"Total extras", v:"+5h 50m", i:"📈" },
+              { l:"Pendências", v:"1 func.", i:"⚠️" },
+            ].map(({ l, v, i }) => (
+              <div key={l} style={{ background:"rgba(255,255,255,0.03)", borderRadius:12, padding:"10px 12px" }}>
+                <p style={{ fontSize:17, marginBottom:3 }}>{i}</p>
+                <p style={{ fontFamily:"'DM Mono',monospace", fontSize:14, fontWeight:500, color:"#E2E8F7" }}>{v}</p>
+                <p style={{ fontSize:11, color:"#4A5980", marginTop:2 }}>{l}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+        <section className="f3">
+          <h2 style={{ fontFamily:"'Syne',sans-serif", fontSize:13, fontWeight:700, color:"#94A3C4", marginBottom:12 }}>Colaboradores</h2>
+          <div className="card" style={{ padding:"0 14px" }}>
+            {TEAM.map((e, i) => (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 0", borderBottom:i<TEAM.length-1?"1px solid rgba(255,255,255,0.05)":"none" }}>
+                <div className="av" style={{ width:35, height:35, fontSize:11, fontWeight:700, background:`${e.c}15`, color:e.c, border:`1px solid ${e.c}35` }}>{ini(e.name)}</div>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <p style={{ fontSize:13, fontWeight:600, color:"#94A3C4" }}>{e.name}</p>
+                  <p style={{ fontSize:11, color:"#4A5980" }}>{e.role}</p>
+                </div>
+                <div style={{ textAlign:"right", flexShrink:0 }}>
+                  <p style={{ fontFamily:"'DM Mono',monospace", fontSize:12, color:"#94A3C4" }}>{e.h}</p>
+                  <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11, marginTop:1, color:e.e.startsWith("+")?"#22C55E":"#EF4444" }}>{e.e}</p>
+                </div>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4A5980" strokeWidth="2.5" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// ── SETTINGS ──
+function SettingsScreen({ session, apiKey, onApiKey, onLogout }) {
+  const [key, setKey] = useState(apiKey || "");
+  const [show, setShow] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+
+  const save = useCallback(() => {
+    onApiKey(key.trim());
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+  }, [key, onApiKey]);
+
+  const logout = useCallback(() => {
+    if (confirm) { ls.del(SK.SESSION); onLogout(); }
+    else { setConfirm(true); setTimeout(() => setConfirm(false), 3500); }
+  }, [confirm, onLogout]);
+
+  const isSaved = apiKey?.trim().length > 0;
+
+  return (
+    <div className="scroll">
+      <SBar />
+      <div style={{ padding:"6px 20px 96px" }}>
+        <h1 className="f0" style={{ fontFamily:"'Syne',sans-serif", fontSize:20, fontWeight:800, color:"#E2E8F7", letterSpacing:"-0.03em", marginBottom:20 }}>Configurações</h1>
+
+        <div className="f1 card-c" style={{ padding:14, marginBottom:20, display:"flex", alignItems:"center", gap:12 }}>
+          <div className="av" style={{ width:50, height:50, background:"linear-gradient(135deg,#06B6D4,#0891B2)", fontSize:16, fontWeight:800, color:"#fff" }}>
+            {ini(session.name)}
+          </div>
+          <div style={{ flex:1 }}>
+            <p style={{ fontFamily:"'Syne',sans-serif", fontSize:15, fontWeight:700, color:"#E2E8F7" }}>{session.name}</p>
+            <p style={{ fontSize:12, color:"#4A5980", marginTop:2 }}>{session.email}</p>
+            <div style={{ display:"flex", gap:7, marginTop:7 }}>
+              <span className="badge b-inf">Usuário</span>
+              <span className="badge b-ok">Ativo</span>
+            </div>
+          </div>
+        </div>
+
+        <section className="f2" style={{ marginBottom:18 }}>
+          <p style={{ fontSize:10, fontWeight:700, color:"#4A5980", letterSpacing:"0.09em", textTransform:"uppercase", marginBottom:10 }}>Chave Gemini API</p>
+          <div className="card" style={{ padding:15 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:9 }}>
+              <I.Key />
+              <p style={{ fontSize:13, fontWeight:600, color:"#E2E8F7", flex:1 }}>Google Gemini API Key</p>
+              {isSaved ? <span className="badge b-ok">✓ Ativa</span> : <span className="badge b-err">Não configurada</span>}
+            </div>
+            <p style={{ fontSize:12, color:"#4A5980", marginBottom:12, lineHeight:1.6 }}>
+              Obtenha gratuitamente em{" "}
+              <span style={{ color:"#06B6D4", fontFamily:"'DM Mono',monospace", fontSize:11 }}>aistudio.google.com</span>
+              {" "}→ Get API Key
+            </p>
+            <div style={{ position:"relative", marginBottom:9 }}>
+              <input type={show?"text":"password"} className="inp-key" value={key}
+                onChange={e => setKey(e.target.value)} placeholder="AIzaSy..."
+                autoComplete="off" spellCheck={false} />
+              <button onClick={() => setShow(v=>!v)}
+                style={{ position:"absolute", right:11, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", color:"#4A5980", padding:0 }}>
+                <I.Eye s={show} />
+              </button>
+            </div>
+            <div style={{ display:"flex", gap:8 }}>
+              <button className="btn btn-p" style={{ flex:1, height:39, fontSize:13 }} onClick={save} disabled={!key.trim()}>
+                {saved ? <><I.Chk c="white" /> Salva!</> : "Salvar chave"}
+              </button>
+              {isSaved && (
+                <button className="btn btn-danger" style={{ width:39, height:39, padding:0 }} onClick={() => { setKey(""); onApiKey(""); }}>
+                  <I.Trash />
+                </button>
+              )}
+            </div>
+            {!isSaved && <p style={{ fontSize:11, color:"#EAB308", marginTop:9 }}>⚠ Sem a chave, o processamento não funcionará.</p>}
+          </div>
+        </section>
+
+        <section className="f3" style={{ marginBottom:18 }}>
+          <p style={{ fontSize:10, fontWeight:700, color:"#4A5980", letterSpacing:"0.09em", textTransform:"uppercase", marginBottom:10 }}>Preferências</p>
+          <div className="card" style={{ padding:"0 14px" }}>
+            {[
+              { l:"Idioma", s:"Português (BR)" },
+              { l:"Fuso horário", s:"GMT-3 (Brasília)" },
+              { l:"Exportação", s:"PDF + Excel" },
+              { l:"Modelo de IA", s:"Gemini 1.5 Flash" },
+            ].map((item, i, arr) => (
+              <div key={i} className="srow" style={{ borderBottom:i<arr.length-1?"1px solid rgba(255,255,255,0.05)":"none" }}>
+                <div style={{ flex:1 }}>
+                  <p style={{ fontSize:13, fontWeight:500, color:"#94A3C4" }}>{item.l}</p>
+                  <p style={{ fontSize:11, color:"#4A5980", marginTop:2 }}>{item.s}</p>
+                </div>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4A5980" strokeWidth="2.5" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <div className="f4" style={{ marginBottom:11 }}>
+          <button className="btn btn-danger" style={{ width:"100%", height:46, fontSize:14 }} onClick={logout}>
+            <I.Out /> {confirm ? "Confirme: clique novamente" : "Sair da conta"}
+          </button>
+        </div>
+        <p style={{ textAlign:"center", fontSize:11, color:"rgba(74,89,128,0.5)" }}>PontoScan AI v{APP_VER} · Gemini Vision</p>
+      </div>
+    </div>
+  );
+}
+
+// ── TOAST ──
+function Toast({ msg, onClose, onRetry }) {
+  useEffect(() => { const t = setTimeout(onClose, 9000); return () => clearTimeout(t); }, [onClose]);
+  return (
+    <div className="toast">
+      <div style={{ display:"flex", justifyContent:"space-between", gap:10, marginBottom:onRetry?9:0 }}>
+        <p style={{ flex:1, lineHeight:1.55 }}>{msg}</p>
+        <button onClick={onClose} style={{ background:"none", border:"none", color:"#FCA5A5", cursor:"pointer", fontSize:18, lineHeight:1 }}>✕</button>
+      </div>
+      {onRetry && (
+        <button className="btn btn-danger" style={{ width:"100%", height:34, fontSize:13 }} onClick={onRetry}>
+          Tentar novamente
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── APP ──
+export default function App() {
+  const [session, setSession] = useState(() => ls.get(SK.SESSION));
+  const [auth, setAuth] = useState("login");
+  const [apiKey, setApiKey] = useState(() => ls.get(SK.API_KEY, ""));
+  const [nav, dispatch] = useReducer(navReducer, { prev:null, current:"home", dir:"r" });
+  const [pFile, setPFile] = useState(null);
+  const [result, setResult] = useState(null);
+  const [rFile, setRFile] = useState(null);
+  const [errMsg, setErrMsg] = useState(null);
+  const [history, setHistory] = useState(() => ls.get(SK.HISTORY, []));
+
+  const goTo = useCallback(t => dispatch({ type:"GO", to:t }), []);
+
+  const handleLogin = useCallback(sess => {
+    setSession(sess);
+    setHistory(ls.get(SK.HISTORY, []));
+    goTo("home");
+  }, [goTo]);
+
+  const handleLogout = useCallback(() => {
+    setSession(null); setPFile(null); setResult(null); setErrMsg(null);
+    setAuth("login");
+  }, []);
+
+  const handleApiKey = useCallback(k => {
+    setApiKey(k);
+    ls.set(SK.API_KEY, k);
+  }, []);
+
+  const handleFile = useCallback(file => {
+    setPFile(file); setErrMsg(null); goTo("processing");
+  }, [goTo]);
+
+  const handleDone = useCallback((data, file) => {
+    setResult(data); setRFile(file);
+    const name = data?.employee?.name || "Não identificado";
+    const now = new Date();
+    const ms = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"];
+    const entry = { name, date:`${now.getDate()} ${ms[now.getMonth()]}`, hours:data?.summary?.total_hours||"—", ts:now.getTime() };
+    setHistory(h => { const n = [entry, ...h].slice(0,50); ls.set(SK.HISTORY, n); return n; });
+    goTo("result");
+  }, [goTo]);
+
+  const handleErr = useCallback(msg => { setErrMsg(msg); goTo("capture"); }, [goTo]);
+  const handleRetry = useCallback(() => { setErrMsg(null); if (pFile) goTo("processing"); }, [pFile, goTo]);
+
+  const ss = useCallback(id => {
+    if (id === nav.current) return "on";
+    return SCREEN_ORDER.indexOf(id) < SCREEN_ORDER.indexOf(nav.current) ? "l" : "r";
+  }, [nav.current]);
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="aw">
+        <div className="shell">
+          <div className="notch" />
+          {!session ? (
+            <>
+              {auth === "login" && <div className="scr" data-s="on"><LoginScreen onLogin={handleLogin} onReg={() => setAuth("register")} /></div>}
+              {auth === "register" && <div className="scr" data-s="on"><RegScreen onLogin={handleLogin} onBack={() => setAuth("login")} /></div>}
+            </>
+          ) : (
+            <>
+              <div className="scr" data-s={ss("home")}>
+                <HomeScreen onCapture={() => goTo("capture")} history={history} session={session} />
+                <BNav cur={nav.current} onNav={goTo} />
+              </div>
+              <div className="scr" data-s={ss("capture")}>
+                <CaptureScreen onBack={() => goTo("home")} onProcess={handleFile} apiKey={apiKey} />
+              </div>
+              <div className="scr" data-s={ss("processing")}>
+                {nav.current === "processing" && pFile && (
+                  <ProcessingScreen file={pFile} apiKey={apiKey} onDone={handleDone} onError={handleErr} />
+                )}
+              </div>
+              <div className="scr" data-s={ss("result")}>
+                {result && <ResultScreen data={result} imageFile={rFile} onBack={() => goTo("capture")} onHome={() => goTo("home")} />}
+                <BNav cur={nav.current} onNav={goTo} />
+              </div>
+              <div className="scr" data-s={ss("company")}>
+                <CompanyScreen />
+                <BNav cur={nav.current} onNav={goTo} />
+              </div>
+              <div className="scr" data-s={ss("settings")}>
+                <SettingsScreen session={session} apiKey={apiKey} onApiKey={handleApiKey} onLogout={handleLogout} />
+                <BNav cur={nav.current} onNav={goTo} />
+              </div>
+              {errMsg && <Toast msg={errMsg} onClose={() => setErrMsg(null)} onRetry={pFile ? handleRetry : null} />}
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
